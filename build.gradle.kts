@@ -6,10 +6,16 @@ plugins {
     id("net.mamoe.mirai-console") version "2.10.0"
 }
 
-group = "org.example"
+group = "pub.lug"
 version = "0.1.0"
 
 repositories {
-    maven("https://maven.aliyun.com/repository/public") // 阿里云国内代理仓库
+    maven("https://maven.aliyun.com/repository/public")
+    maven("https://maven.aliyun.com/repository/google/")
+    mavenLocal()
     mavenCentral()
+}
+
+dependencies{
+    implementation("org.kohsuke:github-api:1.303")
 }
