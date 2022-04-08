@@ -1,21 +1,29 @@
 package pub.lug.mirai.plugin
 
+import net.mamoe.mirai.console.data.AutoSavePluginConfig
+import net.mamoe.mirai.console.data.value
 import net.mamoe.mirai.console.plugin.jvm.JvmPluginDescription
 import net.mamoe.mirai.console.plugin.jvm.KotlinPlugin
+import net.mamoe.mirai.contact.nameCardOrNick
 import net.mamoe.mirai.event.GlobalEventChannel
-import net.mamoe.mirai.event.events.BotInvitedJoinGroupRequestEvent
-import net.mamoe.mirai.event.events.FriendMessageEvent
 import net.mamoe.mirai.event.events.GroupMessageEvent
-import net.mamoe.mirai.event.events.NewFriendRequestEvent
-import net.mamoe.mirai.message.data.Image
-import net.mamoe.mirai.message.data.Image.Key.queryUrl
-import net.mamoe.mirai.message.data.PlainText
+import net.mamoe.mirai.message.data.*
+import net.mamoe.mirai.message.data.MessageSource.Key.quote
 import net.mamoe.mirai.utils.info
+import net.mamoe.mirai.utils.warning
+import okhttp3.OkHttpClient
+import org.kohsuke.github.GitHubBuilder
+import org.kohsuke.github.extras.okhttp3.OkHttpGitHubConnector
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.time.format.FormatStyle
+import java.util.*
 
 object ScribePlugin : KotlinPlugin(
     JvmPluginDescription(
         id = "pub.lug.mirai.plugin.ScribePlugin",
-        name = "LUG 书记",
+        name = "Scribe",
         version = "0.1.0"
     ) {
         author("shirok1")
@@ -27,49 +35,164 @@ object ScribePlugin : KotlinPlugin(
         )
     }
 ) {
+    data class ScribeRecord(
+        val ids: IntArray,
+        val sender: String,
+        val message: MessageChain,
+        val time: Int
+    ) {
+        override fun toString(): String {
+            return "$sender (${
+                Instant.ofEpochSecond(time.toLong()).atZone(
+                    ZoneId.of("Asia/Shanghai")
+                ).format(DateTimeFormatter.ofLocalizedDateTime(FormatStyle.SHORT).withLocale(Locale.CHINA))
+            }): ${message.contentToString()}"
+        }
+
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (javaClass != other?.javaClass) return false
+
+            other as ScribeRecord
+
+            if (!ids.contentEquals(other.ids)) return false
+
+            return true
+        }
+
+        override fun hashCode(): Int {
+            return ids.contentHashCode()
+        }
+    }
+
+    private fun GroupMessageEvent.record(): ScribeRecord {
+//        return ScribeRecord(source.ids, senderName, message, time)
+        return ScribeRecord(source.ids, Config.qqGitHub.getOrDefault(sender.id, senderName), message, time)
+    }
+
+    private fun QuoteReply.record(senderName: String): ScribeRecord {
+        return ScribeRecord(source.ids, senderName, source.originalMessage, source.time)
+    }
+
+    private val messageCache: MutableMap<Long, CircularArray<ScribeRecord>> = mutableMapOf()
+
+    private const val RING_CACHE_SIZE = 1024
+    private fun cacheFor(group: Long): CircularArray<ScribeRecord> {
+        return messageCache.getOrPut(group) { CircularArray(RING_CACHE_SIZE) }
+    }
+
+    private fun GroupMessageEvent.getCache(): CircularArray<ScribeRecord> = cacheFor(group.id)
+
+    object Config : AutoSavePluginConfig("Map") {
+        val groupRepo: MutableMap<Long, String> by value()
+        val qqGitHub: MutableMap<Long, String> by value()
+    }
+
+    private val ghClient = GitHubBuilder.fromPropertyFile().withConnector(
+        OkHttpGitHubConnector(
+            OkHttpClient.Builder()
+//                .cache(Cache(cacheDirectory, 10 * 1024 * 1024))
+                .build()
+        )
+    ).build()
+
+    private fun appendToIssue(text: String, group: Long) {
+        val repoName = Config.groupRepo.getOrDefault(group, null)
+        if (repoName == null) {
+            logger.warning { "群 $group 无对应 GitHub 仓库" }
+            return
+        }
+        val repo = ghClient.getRepository(repoName)
+        if (repo == null) {
+            logger.warning { "无法访问 GitHub 仓库" }
+            return
+        }
+
+        repo.queryIssues().list()
+            .filter { it.labels.any { ghLabel -> ghLabel.name == "collecting" } }
+            .sortedByDescending { it.createdAt }.firstOrNull()?.comment(text)
+    }
+
+    private fun GroupMessageEvent.saveMessage(message: ScribeRecord) = appendToIssue(message.toString(), group.id)
+
+    private fun GroupMessageEvent.saveMessages(messages: Iterable<ScribeRecord>) =
+        appendToIssue(messages.joinToString("\n"), group.id)
+
+    private var lastMessage: MessageChain? = null
+
     override fun onEnable() {
-        logger.info { "Plugin loaded" }
-        //配置文件目录 "${dataFolder.absolutePath}/"
+        Config.reload()
+        logger.info { "书记插件已加载" }
+        logger.info { "群组与 Repo 对应关系：" + Config.groupRepo.map { "${it.key}: ${it.value}" }.joinToString("; ") }
+        logger.info { "QQ 号与 GitHub 用户名对应关系：" + Config.qqGitHub.map { "${it.key}: ${it.value}" }.joinToString("; ") }
         val eventChannel = GlobalEventChannel.parentScope(this)
-        eventChannel.subscribeAlways<GroupMessageEvent>{
-            //群消息
-            //复读示例
-            if (message.contentToString().startsWith("复读")) {
-                group.sendMessage(message.contentToString().replace("复读", ""))
-            }
-            if (message.contentToString() == "hi") {
-                //群内发送
-                group.sendMessage("hi")
-                //向发送者私聊发送消息
-                sender.sendMessage("hi")
-                //不继续处理
-                return@subscribeAlways
-            }
-            //分类示例
-            message.forEach {
-                //循环每个元素在消息里
-                if (it is Image) {
-                    //如果消息这一部分是图片
-                    val url = it.queryUrl()
-                    group.sendMessage("图片，下载地址$url")
+        eventChannel.subscribeAlways<GroupMessageEvent> {
+            if (!message.any { it is At && it.target == this.bot.id }) {
+                getCache().add(record()) // Cache
+            } else {
+                val quote = message.firstIsInstanceOrNull<QuoteReply>()
+                if (quote != null) when {
+                    message.content.contains("保存") -> {
+                        //保存单条消息
+                        saveMessage(
+                            quote.record(
+                                Config.qqGitHub.getOrDefault(quote.source.fromId, null)
+                                    ?: getCache().firstOrNull { it.ids.contentEquals(quote.source.ids) }?.sender
+                                    ?: group[quote.source.fromId]?.nameCardOrNick ?: "佚名"
+                            )
+                        )
+                        group.sendMessage(buildMessageChain {
+                            //+this@subscribeAlways.message.quote()
+                            //+PlainText("保存“${quote.source.originalMessage}”成功")
+                            +PlainText("保存成功")
+                        })
+                    }
+
+                    else -> {
+                        //保存多条消息，结束标识
+                        val toSave = getCache()
+                            .dropWhile { !it.ids.contentEquals(quote.source.ids) }
+                            //.takeWhile { it != lastMessage }
+                            .toList()
+                        if (!toSave.any()) {
+                            group.sendMessage(buildMessageChain {
+                                +"貌似没有可以保存的东西……"
+                            })
+                        } else {
+                            saveMessages(toSave)
+                            group.sendMessage(buildMessageChain {
+                                +"保存内容一览：\n"
+                                toSave.forEach {
+                                    +(it.toString() + "\n")
+                                }
+                            })
+                        }
+                    }
                 }
-                if (it is PlainText) {
-                    //如果消息这一部分是纯文本
-                    group.sendMessage("纯文本，内容:${it.content}")
+                else {
+                    if (message.any { it is PlainText && it.content.contains("浏览") }) {
+                        group.sendMessage(buildMessageChain {
+                            val cache = getCache()
+                            if (cache.any()) {
+                                +"已经记录下的东西：\n"
+                                cache.forEach {
+                                    +(it.toString() + "\n")
+                                }
+                            } else {
+                                +"目前在这个群还没有记录……"
+                            }
+                        })
+                    } else {
+                        //开始保存多条消息
+                        lastMessage = message
+                        group.sendMessage(buildMessageChain {
+                            +this@subscribeAlways.message.quote()
+                            +"请选择要保存的范围，回复最早的一条消息并@我"
+                        })
+                    }
+
                 }
             }
-        }
-        eventChannel.subscribeAlways<FriendMessageEvent>{
-            //好友信息
-            sender.sendMessage("hi")
-        }
-        eventChannel.subscribeAlways<NewFriendRequestEvent>{
-            //自动同意好友申请
-            accept()
-        }
-        eventChannel.subscribeAlways<BotInvitedJoinGroupRequestEvent>{
-            //自动同意加群申请
-            accept()
         }
     }
 }
