@@ -68,6 +68,7 @@ object ScribePlugin : KotlinPlugin(
                     when (it) {
                         is Image -> "![${it.imageId}](${it.queryUrl()})"
                         is FlashImage -> "![${it.image.imageId}](${it.image.queryUrl()})"
+                        is LightApp -> it.extract().run { "[$first]($second)" }
                         else -> it.content
                     }
                 }.joinToString()
@@ -88,6 +89,27 @@ object ScribePlugin : KotlinPlugin(
         override fun hashCode(): Int {
             return ids.contentHashCode()
         }
+    }
+
+    private fun LightApp.extract(): Pair<String, String> {
+        val obj = Json.parseToJsonElement(content)
+
+        fun traverse(entry: Map.Entry<String, JsonElement>): List<Pair<String, JsonPrimitive>> {
+            return when (val value = entry.value) {
+                is JsonObject -> value.asIterable().flatMap { traverse(it) }
+                is JsonPrimitive -> listOf(entry.key to value)
+                is JsonArray -> emptyList()
+            }
+        }
+
+        val url = obj.jsonObject.flatMap { traverse(it) }.firstOrNull {
+            it.first.contains("url", true)
+                && it.second.content.isNotEmpty()
+        }?.second?.content ?: ""
+
+        val prompt = obj.jsonObject["prompt"]?.jsonPrimitive?.content ?: content
+
+        return prompt to url
     }
 
     private fun GroupMessageEvent.record(): ScribeRecord {
