@@ -1,5 +1,6 @@
 package pub.lug.mirai.plugin
 
+import kotlinx.serialization.json.*
 import net.mamoe.mirai.console.data.AutoSavePluginConfig
 import net.mamoe.mirai.console.data.value
 import net.mamoe.mirai.console.plugin.jvm.JvmPluginDescription
@@ -8,6 +9,7 @@ import net.mamoe.mirai.contact.nameCardOrNick
 import net.mamoe.mirai.event.GlobalEventChannel
 import net.mamoe.mirai.event.events.GroupMessageEvent
 import net.mamoe.mirai.message.data.*
+import net.mamoe.mirai.message.data.Image.Key.queryUrl
 import net.mamoe.mirai.message.data.MessageSource.Key.quote
 import net.mamoe.mirai.utils.info
 import net.mamoe.mirai.utils.warning
@@ -46,7 +48,30 @@ object ScribePlugin : KotlinPlugin(
                 Instant.ofEpochSecond(time.toLong()).atZone(
                     ZoneId.of("Asia/Shanghai")
                 ).format(DateTimeFormatter.ofLocalizedDateTime(FormatStyle.SHORT).withLocale(Locale.CHINA))
-            }): ${message.contentToString()}"
+            }): ${message.content}"
+        }
+
+        private var markdown: String? = null
+
+        suspend fun toMarkdown(): String {
+            if (markdown == null) markdown = renderMarkdown()
+            return markdown!!
+        }
+
+        private suspend fun renderMarkdown(): String {
+            return "$sender (${
+                Instant.ofEpochSecond(time.toLong()).atZone(
+                    ZoneId.of("Asia/Shanghai")
+                ).format(DateTimeFormatter.ofLocalizedDateTime(FormatStyle.SHORT).withLocale(Locale.CHINA))
+            }): ${
+                message.filterIsInstance<MessageContent>().map {
+                    when (it) {
+                        is Image -> "![${it.imageId}](${it.queryUrl()})"
+                        is FlashImage -> "![${it.image.imageId}](${it.image.queryUrl()})"
+                        else -> it.content
+                    }
+                }.joinToString()
+            }"
         }
 
         override fun equals(other: Any?): Boolean {
@@ -70,8 +95,9 @@ object ScribePlugin : KotlinPlugin(
         return ScribeRecord(source.ids, Config.qqGitHub.getOrDefault(sender.id, senderName), message, time)
     }
 
-    private fun QuoteReply.record(senderName: String): ScribeRecord {
-        return ScribeRecord(source.ids, senderName, source.originalMessage, source.time)
+    private fun QuoteReply.record(senderName: String, cache: CircularArray<ScribeRecord>? = null): ScribeRecord {
+        return cache?.firstOrNull { it.ids.contentEquals(source.ids) }
+            ?: ScribeRecord(source.ids, senderName, source.originalMessage, source.time)
     }
 
     private val messageCache: MutableMap<Long, CircularArray<ScribeRecord>> = mutableMapOf()
@@ -113,10 +139,11 @@ object ScribePlugin : KotlinPlugin(
             .sortedByDescending { it.createdAt }.firstOrNull()?.comment(text)
     }
 
-    private fun GroupMessageEvent.saveMessage(message: ScribeRecord) = appendToIssue(message.toString(), group.id)
+    private suspend fun GroupMessageEvent.saveMessage(message: ScribeRecord) =
+        appendToIssue(message.toMarkdown(), group.id)
 
-    private fun GroupMessageEvent.saveMessages(messages: Iterable<ScribeRecord>) =
-        appendToIssue(messages.joinToString("\n"), group.id)
+    private suspend fun GroupMessageEvent.saveMessages(messages: Iterable<ScribeRecord>) =
+        appendToIssue(messages.map { it.toMarkdown() }.joinToString("\n"), group.id)
 
     private var lastMessage: MessageChain? = null
 
@@ -134,17 +161,18 @@ object ScribePlugin : KotlinPlugin(
                 if (quote != null) when {
                     message.content.contains("保存") -> {
                         //保存单条消息
-                        saveMessage(
-                            quote.record(
-                                Config.qqGitHub.getOrDefault(quote.source.fromId, null)
-                                    ?: getCache().firstOrNull { it.ids.contentEquals(quote.source.ids) }?.sender
-                                    ?: group[quote.source.fromId]?.nameCardOrNick ?: "佚名"
-                            )
+                        val record = quote.record(
+                            Config.qqGitHub.getOrDefault(quote.source.fromId, null)
+                                ?: getCache().firstOrNull { it.ids.contentEquals(quote.source.ids) }?.sender
+                                ?: group[quote.source.fromId]?.nameCardOrNick ?: "佚名",
+                            getCache()
                         )
+                        saveMessage(record)
                         group.sendMessage(buildMessageChain {
                             //+this@subscribeAlways.message.quote()
                             //+PlainText("保存“${quote.source.originalMessage}”成功")
-                            +PlainText("保存成功")
+                            +"保存成功，内容如下："
+                            +record.toMarkdown()
                         })
                     }
 
@@ -163,7 +191,7 @@ object ScribePlugin : KotlinPlugin(
                             group.sendMessage(buildMessageChain {
                                 +"保存内容一览：\n"
                                 toSave.forEach {
-                                    +(it.toString() + "\n")
+                                    +(it.toMarkdown() + "\n")
                                 }
                             })
                         }
@@ -176,7 +204,7 @@ object ScribePlugin : KotlinPlugin(
                             if (cache.any()) {
                                 +"已经记录下的东西：\n"
                                 cache.forEach {
-                                    +(it.toString() + "\n")
+                                    +(it.toMarkdown() + "\n")
                                 }
                             } else {
                                 +"目前在这个群还没有记录……"
